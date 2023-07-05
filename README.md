@@ -40,12 +40,12 @@ label_fn = lambda label: roberta.task.label_dictionary.string(
 ncorrect, nsamples = 0, 0
 roberta.cuda()
 roberta.eval()
-with open('glue_data/RTE/dev.tsv') as fin:
+with open('glue_data/SST-2/dev.tsv') as fin:
     fin.readline()
     for index, line in enumerate(fin):
         tokens = line.strip().split('\t')
-        sent1, sent2, target = tokens[1], tokens[2], tokens[3]
-        tokens = roberta.encode(sent1, sent2)
+        sent, target = tokens[0], tokens[1]
+        tokens = roberta.encode(sent)
         prediction = roberta.predict('sentence_classification_head', tokens).argmax().item()
         prediction_label = label_fn(prediction)
         ncorrect += int(prediction_label == target)
