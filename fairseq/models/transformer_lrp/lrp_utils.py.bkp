@@ -1,0 +1,426 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+from typing import Any, Tuple
+import torch.autograd as autograd
+from torch.nn import ModuleList, ModuleDict
+
+
+def batch_jacobian(func, input: torch.Tensor):
+    assert len(input.size()) == 2
+    return torch.stack([autograd.functional.jacobian(func, t) for t in input])
+
+
+def tuple_jacobian(func, inputs: Tuple[torch.Tensor], batch_dim=0):
+    # only support batch_size = 1
+    return autograd.functional.jacobian(func, inputs)  # out_dims , input_dims
+
+
+def batch_diag(t: torch.Tensor):
+    batch_size, hid_size = t.size()
+    diag_t = torch.zeros((batch_size, hid_size, hid_size)).to(t)
+    diag_t.as_strided(t.size(), [diag_t.stride(0), diag_t.size(2) + 1,],).copy_(t)
+    return diag_t
+
+
+def batch_diag_value(v: torch.Tensor, m_size):
+    assert len(v.size()) == 1
+    batch_size = v.size(0)
+    # print(v)
+    diag_t = torch.zeros((batch_size, m_size, m_size)).to(v)
+    diag_t = (diag_t + torch.eye(m_size).to(device=v.device)[None]) * v[:, None, None]
+    # index = torch.arange(0,m_size, device=v.device)
+    # diag_t[:,index,index] = v
+    return diag_t
+
+
+class LRP:
+    """ Helper class for layerwise relevance propagation """
+
+    alpha = 0.5
+    beta = 0.5
+    eps = 1e-10
+    use_alpha_beta = True  # if False, uses simplified LRP rule:  R_i =  R_j * z_ji / ( z_j + eps * sign(z_j) )
+    consider_attn_constant = (
+        False  # used by MultiHeadAttn, considers gradient w.r.t q/k zeros
+    )
+    norm_dim = 1
+
+    @classmethod
+    def relprop(
+        cls,
+        function,
+        out_relevance,
+        inputs: Tuple[torch.Tensor],
+        reference_inputs=None,
+        reference_output=None,
+        jacobians=None,
+        batch_dim=0,
+    ):
+        """
+        computes input relevance given output_relevance using z+ rule
+        works for linear layers, convolutions, poolings, etc.
+        notation from DOI:10.1371/journal.pone.0130140, Eq 60
+        :param function: forward function
+        :param output_relevance: relevance w.r.t. layer output
+        :param inps: a list of layer inputs
+        :param reference_inputs: \hat x, default values used to evaluate bias relevance.
+            If specified, must be a tuple/list of tensors of the same shape as inps, default = all zeros.
+        :param reference_output: optional pre-computed function(*reference_inputs) to speed up computation
+        :param jacobians: optional pre-computed jacobians to speed up computation, same as jacobians(function(*inps), inps)
+
+        """
+        assert len(inputs) > 0, "please provide at least one input"
+
+        alpha, beta, eps = cls.alpha, cls.beta, cls.eps
+
+        reference_inputs = reference_inputs or [
+            torch.zeros_like(input).to(input) for input in inputs
+        ]
+        assert len(reference_inputs) == len(inputs)
+
+        output = function(*inputs)
+        reference_output = (
+            reference_output
+            if reference_output is not None
+            else function(*reference_inputs)
+        )
+        assert isinstance(output, torch.Tensor) and isinstance(
+            reference_output, torch.Tensor
+        )
+        assert out_relevance.size() == output.size()
+
+        flat_out_relevance = out_relevance.view(-1)
+        output_size = flat_out_relevance.size(0)
+
+        # 1. compute jacobian w.r.t. all inputs
+        jacobians = (
+            jacobians if jacobians is not None else tuple_jacobian(function, inputs)
+        )
+        # ^-- list of [*output_dims, *input_dims] for each input
+        assert len(jacobians) == len(inputs)
+
+        jac_flat_components = [jac.view(output_size, -1) for jac in jacobians]
+        # ^-- list of [output_size, input_size] for each input
+        flat_jacobian = torch.cat(
+            jac_flat_components, dim=-1
+        )  # [output_size, combined_input_size]
+
+        # 2. multiply jacobian by input to get unnormalized relevances, add bias
+
+        flat_input = torch.cat(
+            [input.view(-1) for input in inputs], dim=-1
+        )  # [combined_input_size]
+        flat_reference_input = torch.cat(
+            [ref_input.view(-1) for ref_input in reference_inputs], dim=-1
+        )  # [combined_input_size]
+        batch_size = output.size(batch_dim)
+        input_size_per_sample = flat_input.size(0) // batch_size
+        flat_bias_impact = reference_output.view(-1) / input_size_per_sample
+
+        flat_impact = (
+            flat_bias_impact[:, None]
+            + flat_jacobian * (flat_input - flat_reference_input)[None, :]
+        )
+
+        # ^-- [output_size, combined_input_size], aka z_{j<-i}
+
+        if cls.use_alpha_beta:
+            # 3. normalize positive and negative relevance separately and add them with coefficients
+            flat_positive_impact = torch.maximum(
+                flat_impact, torch.zeros_like(flat_impact)
+            )
+            flat_positive_normalizer = (
+                torch.sum(flat_positive_impact, dim=cls.norm_dim, keepdim=True) + eps
+            )
+            flat_positive_relevance = flat_positive_impact / flat_positive_normalizer
+
+            flat_negative_impact = torch.minimum(
+                flat_impact, torch.zeros_like(flat_impact)
+            )
+            flat_negative_normalizer = (
+                torch.sum(flat_negative_impact, dim=cls.norm_dim, keepdim=True) - eps
+            )
+            flat_negative_relevance = flat_negative_impact / flat_negative_normalizer
+            flat_total_relevance_transition = (
+                alpha * flat_positive_relevance + beta * flat_negative_relevance
+            )
+        else:
+            raise NotImplemented()
+            # flat_impact_normalizer = tf.reduce_sum(flat_impact, axis=cls.norm_axis, keep_dims=True)
+            # flat_impact_normalizer += eps * (1. - 2. * tf.to_float(tf.less(flat_impact_normalizer, 0)))
+            # flat_total_relevance_transition = flat_impact / flat_impact_normalizer
+            # note: we do not use tf.sign(z) * eps because tf.sign(0) = 0, so zeros will not go away
+
+        flat_in_relevance = torch.einsum(
+            "o,oi", flat_out_relevance, flat_total_relevance_transition
+        )
+        # ^-- [combined_input_size]
+
+        # 5. unpack flat_inp_relevance back into individual tensors
+        in_relevances = []
+        offset = 0
+        for input in inputs:
+            input_size = input.view(-1).size(0)
+            inp_relevance = flat_in_relevance[offset : offset + input_size].view_as(input)
+            in_relevances.append(inp_relevance)
+            offset = offset + input_size
+
+        return cls.rescale(out_relevance, in_relevances, batch_dim=batch_dim)
+
+    @classmethod
+    def rescale(
+        cls,
+        out_relevance: torch.Tensor,
+        in_relevances: Tuple[torch.Tensor],
+        batch_dim=None,
+    ):
+        # assert isinstance(batch_axes, (tuple, list))
+        sum_dims = tuple(
+            i
+            for i in range(len(in_relevances[0].size()))
+            if batch_dim is None or i != batch_dim
+        )
+        ref_scale = out_relevance.abs().sum(dim=sum_dims, keepdim=True)  # batch_size x 1*
+        inp_scales = [
+            in_relevance.abs().sum(dim=sum_dims, keepdim=True)
+            for in_relevance in in_relevances
+        ]  # list[batch_size x 1*]
+        total_inp_scale = sum(inp_scales) + cls.eps  # batch_size x 1*
+        in_relevances = [
+            in_relevance * (ref_scale / total_inp_scale) for in_relevance in in_relevances
+        ]
+        return in_relevances
+
+
+class LRPWrapper(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.store = {}
+
+    def record(self, key, value):
+        assert key not in self.store or self.store[key] is None
+        self.store[key] = value
+
+    def get_record(self, key):
+        assert key in self.store and self.store[key] is not False
+        if key not in self.store:
+            return None
+        return self.store[key]
+
+    def clear_record(self):
+        self.store.clear()
+        for key, value in self._modules.items():
+            if isinstance(value, LRPWrapper):
+                value.clear_record()
+            elif isinstance(value, ModuleList):
+                for module in value:
+                    if isinstance(module, LRPWrapper):
+                        module.clear_record()
+            elif isinstance(value, ModuleDict):
+                for _, module in value.items():
+                    if isinstance(module, LRPWrapper):
+                        module.clear_record()
+
+    def relprop(self, out_relevance):
+        raise NotImplemented()
+
+
+class AddWrapper(LRPWrapper):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(self, x, y, record=False):
+        if record:
+            self.record("input1", x)
+            self.record("input2", y)
+        return x + y
+
+    def relprop(self, out_relevance):
+        input1 = self.get_record("input1")
+        input2 = self.get_record("input2")
+        # input: [*dims, inp_size], out: [*dims, out_size]
+
+        # note: we apply relprop for each independent sample in order to avoid quadratic memory requirements
+        flat_input1 = input1.view(-1, input1.size(-1))
+        flat_input2 = input2.view(-1, input2.size(-1))
+        flat_out_relevance = out_relevance.view(-1, out_relevance.size(-1))
+
+        flat_in_relevance = [
+            LRP.relprop(
+                self,
+                flat_out_relevance[i, None],
+                (flat_input1[i, None], flat_input2[i, None]),
+                jacobians=[
+                    torch.eye(flat_input1.size(-1)).to(out_relevance)[None, :, None, :],
+                    torch.eye(flat_input2.size(-1)).to(out_relevance)[None, :, None, :],
+                ],
+            )
+            for i in range(len(flat_input1))
+        ]
+
+        flat_in_relevance1 = torch.cat([items[0] for items in flat_in_relevance], dim=0)
+        flat_in_relevance2 = torch.cat([items[1] for items in flat_in_relevance], dim=0)
+
+        # flat_in_relevance1, flat_in_relevanc2 = LRP.relprop(
+        #     self, flat_out_relevance, (flat_input1, flat_input2)
+        # )
+        in_relevance1 = flat_in_relevance1.view_as(input1)
+        in_relevance2 = flat_in_relevance2.view_as(input2)
+
+        return in_relevance1, in_relevance2
+
+
+class LinearWrapper(LRPWrapper):
+    def __init__(self, linear: torch.nn.Module, activation_fn=None) -> None:
+        super().__init__()
+        self.weight = linear.weight
+        self.bias = linear.bias
+        self.activation_fn = activation_fn
+
+    def forward(self, x, record=False):
+        if record:
+            self.record("input", x)
+        x = x.matmul(self.weight.t())
+        if self.bias is not None:
+            x = x + self.bias
+        if self.activation_fn is not None:
+            x = self.activation_fn(x)
+        return x
+
+    def relprop(self, out_relevance):
+
+        input = self.get_record("input")
+        # input: [*dims, inp_size], out: [*dims, out_size]
+
+        # note: we apply relprop for each independent sample in order to avoid quadratic memory requirements
+        flat_input = input.view(-1, input.size(-1))
+        flat_out_relevance = out_relevance.view(-1, out_relevance.size(-1))
+
+        flat_in_relevance = [
+            LRP.relprop(
+                self,
+                flat_out_relevance[i, None],
+                (flat_input[i, None],),
+                jacobians=[self.weight[None, :, None, :]],
+            )[0]
+            for i in range(len(flat_input))
+        ]
+        flat_in_relevance = torch.cat(flat_in_relevance, dim=0)
+
+        # if flat_input.size(0) == 1:
+        #     flat_in_relevance = LRP.relprop(
+        #         self,
+        #         flat_out_relevance,
+        #         (flat_input,),
+        #         jacobians=[self.weight[None, :, None, :]],
+        #     )[0]
+        # else:
+        #     flat_in_relevance = LRP.relprop(self, flat_out_relevance, (flat_input,))[0]
+
+        in_relevance = flat_in_relevance.view_as(input)
+
+        return in_relevance
+
+
+class LayerNormWrapper(LRPWrapper):
+    """
+    Performs Layer Normalization
+    """
+
+    def __init__(self, layernorm) -> None:
+        super().__init__()
+        self.weight = layernorm.weight
+        self.bias = layernorm.bias
+        self.epsilon = layernorm.eps
+        self.normalized_shape = layernorm.normalized_shape
+
+    def forward(self, x, record=False):
+        if record:
+            self.record("input", x)
+
+        return F.layer_norm(
+            x, self.normalized_shape, self.weight, self.bias, self.epsilon
+        )
+
+    def _jacobian(self, input):
+        assert len(input.size()) == 2, "Please reshape your inputs to [batch, dim]"
+        batch_size = input.size(0)
+        hid_size = input.size(1)
+        centered_input = input - torch.mean(input, dim=-1, keepdim=True)
+        variance = torch.var(centered_input, dim=-1, unbiased=False, keepdim=True)
+        invstd_factor = torch.rsqrt(variance)
+
+        # note: the code below will compute jacobian without taking self.scale into account until the _last_ line
+        # jac_out_wrt_invstd_factor = centered_input
+        jac_out_wrt_variance = -0.5 * (variance + self.epsilon) ** (-1.5)
+
+        jac_out_wrt_squared_difference = jac_out_wrt_variance / hid_size
+
+        jac_out_wrt_centered_input = (
+            batch_diag_value(invstd_factor[:, 0], hid_size)
+            + jac_out_wrt_squared_difference[:, :, None]
+            * 2
+            * centered_input[:, None, :]
+            * centered_input[:, :, None]
+        )
+
+        jac_out_wrt_input = torch.matmul(
+            jac_out_wrt_centered_input,
+            (
+                torch.eye(hid_size).to(input)
+                - (torch.ones((hid_size, hid_size)).to(input) / hid_size)
+            ),
+        )
+        return jac_out_wrt_input  # batch x hid_size x hid_size
+
+    def relprop(self, out_relevance):
+        """
+        computes input relevance given output_relevance
+        :param output_relevance: relevance w.r.t. layer output, [*dims, out_size]
+        notation from DOI:10.1371/journal.pone.0130140, Eq 60
+        """
+        input = self.get_record("input")
+        # input: [*dims, inp_size], out: [*dims, out_size]
+
+        flat_input = input.view(-1, input.size(-1))
+        flat_out_relevance = out_relevance.view(-1, out_relevance.size(-1))
+
+        jacobians = self._jacobian(flat_input)
+        flat_in_relevance = [
+            LRP.relprop(
+                self,
+                flat_out_relevance[i, None],
+                (flat_input[i, None],),
+                jacobians=[jacobians[i, None]],
+            )[0]
+            for i in range(len(flat_input))
+        ]
+        flat_in_relevance = torch.cat(flat_in_relevance, dim=0)
+
+        # flat_in_relevance = LRP.relprop(self, flat_out_relevance, (flat_input,))[0]
+        in_relevance = flat_in_relevance.view_as(input)
+
+        return in_relevance
+
+
+class FFNWrapper(LRPWrapper):
+    """
+    Feed-forward layer
+    """
+
+    def __init__(self, linear_in: LinearWrapper, linear_out: LinearWrapper):
+        super().__init__()
+        self.linear_in = linear_in
+        self.linear_out = linear_out
+
+    def forward(self, x, record=False):
+        x = self.linear_in(x, record=record)
+        x = self.linear_out(x, record=record)
+
+    def relprop(self, out_relevance):
+        mid_relevance = self.linear_out.relprop(out_relevance)
+        in_relevance = self.linear_in.relprop(mid_relevance)
+        return in_relevance
+
