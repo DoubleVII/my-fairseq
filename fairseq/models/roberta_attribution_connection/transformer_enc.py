@@ -27,7 +27,7 @@ from fairseq.models.transformer import TransformerConfig
 
 from fairseq.modules.checkpoint_activations import checkpoint_wrapper
 
-from fairseq.models.test_transformer.multihead_attention_attribution_with_bias import (
+from fairseq.models.transformer_attribution.multihead_attention_attribution_with_bias import (
     MultiheadAttention,
 )
 
@@ -48,6 +48,7 @@ DEFAULT_MAX_TARGET_POSITIONS = 1024
 
 
 DEFAULT_MIN_PARAMS_TO_WRAP = int(1e8)
+
 
 # rewrite name for backward compatibility in `make_generation_fast_`
 def module_name_fordropout(module_name: str) -> str:
@@ -395,11 +396,15 @@ class TransformerEncoder(TransformerEncoderBase):
     def __init__(self, args, dictionary, embed_tokens):
         self.args = args
         super().__init__(
-            TransformerConfig.from_namespace(args), dictionary, embed_tokens,
+            TransformerConfig.from_namespace(args),
+            dictionary,
+            embed_tokens,
         )
 
     def build_encoder_layer(self, args):
-        return super().build_encoder_layer(TransformerConfig.from_namespace(args),)
+        return super().build_encoder_layer(
+            TransformerConfig.from_namespace(args),
+        )
 
 
 class TransformerEncoderLayerBase(nn.Module):
@@ -589,7 +594,9 @@ class TransformerEncoderLayerBase(nn.Module):
             check_error(compositions, x, key_padding_mask=encoder_padding_mask)
             c_residual = compositions
 
-            check_error(coneection_compositions, x, key_padding_mask=encoder_padding_mask)
+            check_error(
+                coneection_compositions, x, key_padding_mask=encoder_padding_mask
+            )
             connection_residual = compositions
 
         residual = x
