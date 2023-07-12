@@ -73,7 +73,6 @@ class LabelSmoothedCrossEntropyCriterionConfig(FairseqDataclass):
     )
 
 
-
 def label_smoothed_nll_loss(lprobs, target, epsilon, ignore_index=None, reduce=True):
     if target.dim() == lprobs.dim() - 1:
         target = target.unsqueeze(-1)
@@ -94,7 +93,10 @@ def label_smoothed_nll_loss(lprobs, target, epsilon, ignore_index=None, reduce=T
     return loss, nll_loss
 
 
-@register_criterion("label_smoothed_cross_entropy_with_noise_detection_bp", dataclass=LabelSmoothedCrossEntropyCriterionConfig)
+@register_criterion(
+    "label_smoothed_cross_entropy_with_noise_detection_bp",
+    dataclass=LabelSmoothedCrossEntropyCriterionConfig,
+)
 class LabelSmoothedCrossEntropyCriterion(FairseqCriterion):
     def __init__(
         self,
@@ -111,7 +113,7 @@ class LabelSmoothedCrossEntropyCriterion(FairseqCriterion):
         no_compute_translation_loss=False,
         report_accuracy=False,
         backward_detector_gradient=False,
-        bp_loss_threshold = 0.8
+        bp_loss_threshold=0.8,
     ):
         super().__init__(task)
         self.sentence_avg = sentence_avg
@@ -120,7 +122,9 @@ class LabelSmoothedCrossEntropyCriterion(FairseqCriterion):
         self.report_accuracy = report_accuracy
         self.detector_loss_epoch = detector_loss_epoch
         self.detector_loss_lambda = detector_loss_lambda
-        self.detector_weight = torch.FloatTensor([negative_loss_weight, positive_loss_weight])
+        self.detector_weight = torch.FloatTensor(
+            [negative_loss_weight, positive_loss_weight]
+        )
         self.no_compute_translation_loss = no_compute_translation_loss
         self.backward_detector_gradient = backward_detector_gradient
         self.bp_loss_threshold = bp_loss_threshold
@@ -131,27 +135,30 @@ class LabelSmoothedCrossEntropyCriterion(FairseqCriterion):
             assert self.forward_with_detector
             assert detector_loss_epoch == 0
 
-
-    def forward_with_detector(self, model, sample, backward_gradient = False,reduce=True):
+    def forward_with_detector(
+        self, model, sample, backward_gradient=False, reduce=True
+    ):
         src_tokens = sample["net_input"]["src_tokens"]
 
         batch_size = src_tokens.size(0)
 
         src_lengths = sample["net_input"]["src_lengths"]
         prev_output_tokens = sample["net_input"]["prev_output_tokens"]
-        
+
         # import pdb
         # pdb.set_trace()
-        
+
         shuffle_index = list(range(batch_size))
         random.shuffle(shuffle_index)
         for i in range(batch_size):
             if shuffle_index[i] == i:
-                shuffle_index[i] = (i+1) % batch_size
+                shuffle_index[i] = (i + 1) % batch_size
         append_src_tokens = torch.cat((src_tokens, src_tokens), dim=0)
         append_src_lengths = torch.cat((src_lengths, src_lengths), dim=0)
         append_prev_output_tokens = prev_output_tokens[shuffle_index]
-        append_prev_output_tokens = torch.cat((prev_output_tokens, append_prev_output_tokens), dim=0)
+        append_prev_output_tokens = torch.cat(
+            (prev_output_tokens, append_prev_output_tokens), dim=0
+        )
         sample["net_input"]["src_tokens"] = append_src_tokens
         sample["net_input"]["src_lengths"] = append_src_lengths
         sample["net_input"]["prev_output_tokens"] = append_prev_output_tokens
@@ -166,12 +173,16 @@ class LabelSmoothedCrossEntropyCriterion(FairseqCriterion):
         # print("net output size:", net_output[0].size())
         if not self.no_compute_translation_loss:
             loss, nll_loss = self.compute_loss(model, net_output, sample, reduce=reduce)
-        
-        detector_target = torch.zeros((batch_size*2,),dtype=torch.long).to(src_tokens)
+
+        detector_target = torch.zeros((batch_size * 2,), dtype=torch.long).to(
+            src_tokens
+        )
         detector_target[batch_size:] = 1
-        detector_loss, n_correct, total, pred = self.compute_detector_loss(net_output, detector_target, reduce=reduce)
+        detector_loss, n_correct, total, pred = self.compute_detector_loss(
+            net_output, detector_target, reduce=reduce
+        )
         if not self.no_compute_translation_loss:
-            loss = loss +  detector_loss * self.detector_loss_lambda
+            loss = loss + detector_loss * self.detector_loss_lambda
         else:
             loss = detector_loss * self.detector_loss_lambda
         sample_size = (
@@ -201,7 +212,11 @@ class LabelSmoothedCrossEntropyCriterion(FairseqCriterion):
         3) logging outputs to display while training
         """
         if self.task.epoch > self.detector_loss_epoch:
-            backward_gradient = (self.task.epoch - self.detector_loss_epoch) % 2=self.bp_epoch_interval != 0
+            # backward_gradient = (self.task.epoch - self.detector_loss_epoch) % 2=self.bp_epoch_interval != 0
+            # bug
+            backward_gradient = (
+                self.task.epoch - self.detector_loss_epoch
+            ) % 2 == self.bp_epoch_interval
             return self.forward_with_detector(model, sample, backward_gradient, reduce)
 
         net_output = model(**sample["net_input"])
@@ -244,13 +259,18 @@ class LabelSmoothedCrossEntropyCriterion(FairseqCriterion):
             reduce=reduce,
         )
         return loss, nll_loss
-    
+
     def compute_detector_loss(self, net_output, target, reduce=True):
         logits = net_output[1]["detector_out"]
         lprobs = utils.log_softmax(logits, dim=-1)
 
-        nll_loss = F.nll_loss(lprobs, target, weight=self.detector_weight.to(lprobs), reduction="sum" if reduce else "none")
-        
+        nll_loss = F.nll_loss(
+            lprobs,
+            target,
+            weight=self.detector_weight.to(lprobs),
+            reduction="sum" if reduce else "none",
+        )
+
         # if target.dim() == lprobs.dim() - 1:
         #     target = target.unsqueeze(-1)
         # nll_loss = -lprobs.gather(dim=-1, index=target)
@@ -269,9 +289,12 @@ class LabelSmoothedCrossEntropyCriterion(FairseqCriterion):
         logits = net_output[1]["detector_out"]
         lprobs = utils.log_softmax(logits, dim=-1)
 
-        nll_loss = F.nll_loss(lprobs, target, weight=self.detector_weight.to(lprobs), reduction="sum" if reduce else "none")
-        
-
+        nll_loss = F.nll_loss(
+            lprobs,
+            target,
+            weight=self.detector_weight.to(lprobs),
+            reduction="sum" if reduce else "none",
+        )
 
     def compute_accuracy(self, model, net_output, sample):
         lprobs, target = self.get_lprobs_and_target(model, net_output, sample)
@@ -290,7 +313,9 @@ class LabelSmoothedCrossEntropyCriterion(FairseqCriterion):
         detector_loss_sum = sum(log.get("detector_loss", 0) for log in logging_outputs)
         ntokens = sum(log.get("ntokens", 0) for log in logging_outputs)
         sample_size = sum(log.get("sample_size", 0) for log in logging_outputs)
-        detection_sentence_num = sum(log.get("detection_sentence_num", 0) for log in logging_outputs)
+        detection_sentence_num = sum(
+            log.get("detection_sentence_num", 0) for log in logging_outputs
+        )
 
         metrics.log_scalar(
             "loss", loss_sum / sample_size / math.log(2), sample_size, round=3
@@ -300,7 +325,10 @@ class LabelSmoothedCrossEntropyCriterion(FairseqCriterion):
         )
         if detection_sentence_num > 0:
             metrics.log_scalar(
-                "detector_loss", detector_loss_sum / detection_sentence_num / math.log(2), detection_sentence_num, round=3
+                "detector_loss",
+                detector_loss_sum / detection_sentence_num / math.log(2),
+                detection_sentence_num,
+                round=3,
             )
         metrics.log_derived(
             "ppl", lambda meters: utils.get_perplexity(meters["nll_loss"].avg)
