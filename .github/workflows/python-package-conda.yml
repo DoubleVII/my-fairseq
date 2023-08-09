@@ -28,4 +28,4 @@ jobs:
         echo $CONDA/bin >> $GITHUB_PATH
     - name: Install dependencies with PyTorch ${{ matrix.pytorch-version }}
       run: |
-        pip install torch==${{ matrix.pytorch-version }}
+        python -m pip install torch==${{ matrix.pytorch-version }}
